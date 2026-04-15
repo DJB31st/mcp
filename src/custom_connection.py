@@ -1,17 +1,24 @@
 """
-Custom asyncmy Connection and Pool classes that disable MULTI_STATEMENTS capability.
+Custom asyncmy Connection and Pool classes that disable MULTI_STATEMENTS capability
+and add connection validation to prevent "packet sequence number wrong" errors.
 
 asyncmy hardcodes MULTI_STATEMENTS in Connection.__init__, but we need to disable it
 for security reasons (to prevent SQL injection via multiple statements).
+
+Additionally, we add connection health checking to prevent reusing stale connections
+that have been closed by the server.
 """
 
 import asyncio
+import logging
 from asyncmy.connection import Connection
 from asyncmy.constants.CLIENT import MULTI_STATEMENTS, LOCAL_FILES
 from asyncmy.pool import Pool
-from asyncmy.contexts import _PoolContextManager
+from asyncmy.contexts import _PoolContextManager, _PoolAcquireContextManager
 
 from config import MCP_READ_ONLY
+
+logger = logging.getLogger(__name__)
 
 
 class SafeConnection(Connection):
@@ -53,9 +60,11 @@ async def safe_connect(**kwargs) -> SafeConnection:
 
 class SafePool(Pool):
     """
-    A Pool subclass that uses SafeConnection instead of Connection.
+    A Pool subclass that uses SafeConnection instead of Connection
+    and validates connections before serving them from the pool.
     
-    This ensures all connections from the pool have MULTI_STATEMENTS disabled.
+    This ensures all connections from the pool have MULTI_STATEMENTS disabled
+    and are still alive before being used.
     """
     
     async def fill_free_pool(self, override_min: bool = False):
@@ -98,6 +107,64 @@ class SafePool(Pool):
                 self._cond.notify()
             finally:
                 self._acquiring -= 1
+    
+    async def _validate_connection(self, conn: Connection) -> bool:
+        """
+        Validate a connection by pinging it.
+        
+        Returns True if the connection is still alive, False otherwise.
+        """
+        try:
+            await conn.ping()
+            return True
+        except Exception as e:
+            logger.warning(f"Connection validation failed: {e}")
+            return False
+    
+    def acquire(self):
+        """
+        Override acquire to return a context manager that validates connections.
+        
+        This ensures that connections from the pool are validated before use.
+        """
+        return _SafePoolAcquireContextManager(self, self._loop)
+
+
+class _SafePoolAcquireContextManager(_PoolAcquireContextManager):
+    """
+    Context manager for acquiring connections from the pool with validation.
+    
+    This validates connections before serving them and creates new ones if validation fails.
+    """
+    
+    async def __aenter__(self):
+        """
+        Acquire a connection from the pool and validate it.
+        
+        If validation fails, the connection is closed and a new one is created.
+        """
+        # Get a connection from the pool using parent logic
+        pool = self._pool
+        
+        while True:
+            async with pool.cond:
+                while True:
+                    await pool.fill_free_pool(True)
+                    if pool._free:
+                        conn = pool._free.popleft()
+                        # Validate the connection
+                        if await pool._validate_connection(conn):
+                            # Connection is valid, use it
+                            self._conn = conn
+                            return conn
+                        else:
+                            # Connection is dead, close it and try again
+                            logger.info("Discarding stale connection from pool, acquiring fresh connection")
+                            conn.close()
+                            # Continue the loop to get another connection
+                    else:
+                        # No free connections available, wait
+                        await pool.cond.wait()
 
 
 def create_safe_pool(
@@ -110,7 +177,8 @@ def create_safe_pool(
     """
     Create a SafePool instead of a regular Pool.
     
-    This is a drop-in replacement for asyncmy.create_pool() that uses SafeConnection.
+    This is a drop-in replacement for asyncmy.create_pool() that uses SafeConnection
+    and validates connections before serving them.
     """
     coro = _create_safe_pool(
         minsize=minsize, 
