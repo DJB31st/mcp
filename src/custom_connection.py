@@ -67,6 +67,10 @@ class SafePool(Pool):
     and are still alive before being used.
     """
     
+    def __init__(self, minsize: int, maxsize: int, pool_recycle: int = 3600, echo: bool = False, **kwargs):
+        """Initialize SafePool by calling parent Pool.__init__."""
+        super().__init__(minsize=minsize, maxsize=maxsize, pool_recycle=pool_recycle, echo=echo, **kwargs)
+    
     async def fill_free_pool(self, override_min: bool = False):
         """
         Override fill_free_pool to use safe_connect instead of connect.
