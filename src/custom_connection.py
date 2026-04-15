@@ -131,15 +131,19 @@ class SafePool(Pool):
         
         This ensures that connections from the pool are validated before use.
         """
-        return _SafePoolAcquireContextManager(self, self._loop)
+        return _SafePoolAcquireContextManager(self)
 
 
-class _SafePoolAcquireContextManager(_PoolAcquireContextManager):
+class _SafePoolAcquireContextManager:
     """
     Context manager for acquiring connections from the pool with validation.
     
     This validates connections before serving them and creates new ones if validation fails.
     """
+    
+    def __init__(self, pool):
+        self._pool = pool
+        self._conn = None
     
     async def __aenter__(self):
         """
@@ -159,6 +163,7 @@ class _SafePoolAcquireContextManager(_PoolAcquireContextManager):
                         # Validate the connection
                         if await pool._validate_connection(conn):
                             # Connection is valid, use it
+                            pool._used.add(conn)
                             self._conn = conn
                             return conn
                         else:
@@ -169,6 +174,14 @@ class _SafePoolAcquireContextManager(_PoolAcquireContextManager):
                     else:
                         # No free connections available, wait
                         await pool.cond.wait()
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Release the connection back to the pool."""
+        try:
+            self._pool.release(self._conn)
+        finally:
+            self._pool = None
+            self._conn = None
 
 
 def create_safe_pool(
